@@ -295,7 +295,7 @@ func spinner(label <-chan string, done <-chan struct{}) {
 }
 
 func main() {
-	minGB := flag.Float64("min", 1.0, "minimum size in GB to show")
+	minGB := flag.Float64("min", 3.0, "minimum size in GB to show")
 	timeoutSec := flag.Int("timeout", 60, "scan timeout in seconds")
 	showVer := flag.Bool("version", false, "print version")
 	flag.Parse()
