@@ -1,27 +1,57 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
-	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const version = "0.1.0"
 
-// scanRoots are drilled into at depth 1 to surface nested large dirs.
-var scanRoots = []string{
-	"",
-	"Library",
-	".cache",
+// drillRoots: show immediate children of these dirs.
+var drillRoots = []string{
 	"Library/Application Support",
+	"Library/Caches",
+	".cache",
+}
+
+// singleRoots: show total size of each.
+var singleRoots = []string{
 	"Library/Containers",
 	"Library/Group Containers",
+	"Library/pnpm",
+	"Library/Android",
+	"Library/Developer",
+	"Library/Unity",
+	".npm",
+	".nvm",
+	".bun",
+	"ws",
+	"ai",
+	"devi",
+	"github.com",
+	"web3",
+}
+
+// cleanupSearchRoots: where to find node_modules/venvs (skip system dirs).
+var cleanupSearchRoots = []string{
+	"projects",
+	"ws",
+	"ai",
+	"devi",
+	"github.com",
+	"web3",
+	"play",
 }
 
 type entry struct {
@@ -29,35 +59,146 @@ type entry struct {
 	bytes int64
 }
 
-func scan(root string) []entry {
-	out, err := exec.Command("du", "-d", "1", "-k", root).Output()
+// dirSize walks a directory tree in parallel using a worker pool.
+// Much faster than spawning du on cold macOS filesystem.
+func dirSize(ctx context.Context, root string) int64 {
+	type workItem struct{ path string }
+
+	work := make(chan workItem, 512)
+	var total atomic.Int64
+	var wg sync.WaitGroup
+
+	workers := runtime.NumCPU() * 4
+	for range workers {
+		go func() {
+			for item := range work {
+				select {
+				case <-ctx.Done():
+					wg.Done()
+					continue
+				default:
+				}
+				entries, err := os.ReadDir(item.path)
+				if err != nil {
+					wg.Done()
+					continue
+				}
+				for _, e := range entries {
+					info, err := e.Info()
+					if err != nil {
+						continue
+					}
+					total.Add(info.Size())
+					if e.IsDir() && !isSymlink(info) {
+						wg.Add(1)
+						select {
+						case work <- workItem{filepath.Join(item.path, e.Name())}:
+						default:
+							// channel full: process inline to avoid deadlock
+							wg.Add(-1)
+							inline(ctx, filepath.Join(item.path, e.Name()), &total)
+						}
+					}
+				}
+				wg.Done()
+			}
+		}()
+	}
+
+	wg.Add(1)
+	work <- workItem{root}
+	wg.Wait()
+	close(work)
+	return total.Load()
+}
+
+func isSymlink(info fs.FileInfo) bool {
+	return info.Mode()&fs.ModeSymlink != 0
+}
+
+// inline walks a subtree synchronously (fallback when work channel is full).
+func inline(ctx context.Context, root string, total *atomic.Int64) {
+	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || ctx.Err() != nil {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() {
+			info, err := d.Info()
+			if err == nil {
+				total.Add(info.Size())
+			}
+		}
+		return nil
+	})
+}
+
+// scanDir returns immediate subdirs of root with their sizes.
+func scanDir(ctx context.Context, root string, spinLabel chan<- string) []entry {
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil
 	}
-	var result []entry
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		p := parts[1]
-		if p == root {
-			continue
-		}
-		kb, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
-		if err != nil {
-			continue
-		}
-		result = append(result, entry{p, kb * 1024})
+	type result struct {
+		path  string
+		bytes int64
 	}
-	return result
+	ch := make(chan result, len(entries))
+	var wg sync.WaitGroup
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		p := filepath.Join(root, e.Name())
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			select {
+			case spinLabel <- "scanning " + shortenPath(path):
+			default:
+			}
+			ch <- result{path, dirSize(ctx, path)}
+		}(p)
+	}
+	wg.Wait()
+	close(ch)
+
+	var out []entry
+	for r := range ch {
+		if r.bytes > 0 {
+			out = append(out, entry{r.path, r.bytes})
+		}
+	}
+	return out
 }
 
-// findCleanup locates node_modules, .venv, and venv dirs and returns their sizes.
-func findCleanup(home string) []entry {
-	out, err := exec.Command("find", home, "-maxdepth", "7", "-type", "d",
+func shortenPath(p string) string {
+	home, _ := os.UserHomeDir()
+	rel := strings.TrimPrefix(p, home)
+	// only show top 3 path segments so spinner isn't flooded by deep subdirs
+	parts := strings.SplitN(strings.TrimPrefix(rel, "/"), "/", 4)
+	if len(parts) > 3 {
+		parts = parts[:3]
+	}
+	return "~/" + strings.Join(parts, "/")
+}
+
+// findCleanup locates node_modules/.venv/venv in project dirs and measures them.
+func findCleanup(ctx context.Context, home string) []entry {
+	var searchPaths []string
+	for _, rel := range cleanupSearchRoots {
+		p := filepath.Join(home, rel)
+		if _, err := os.Stat(p); err == nil {
+			searchPaths = append(searchPaths, p)
+		}
+	}
+	if len(searchPaths) == 0 {
+		return nil
+	}
+
+	args := append([]string{"-maxdepth", "7", "-type", "d",
 		"(", "-name", "node_modules", "-o", "-name", ".venv", "-o", "-name", "venv", ")",
-		"-prune").Output()
+		"-prune"}, searchPaths...)
+	out, err := exec.CommandContext(ctx, "find", args...).Output()
 	if err != nil {
 		return nil
 	}
@@ -67,27 +208,22 @@ func findCleanup(home string) []entry {
 			paths = append(paths, p)
 		}
 	}
-	if len(paths) == 0 {
-		return nil
-	}
 
-	// du -sk on all paths at once
-	args := append([]string{"-sk"}, paths...)
-	out, err = exec.Command("du", args...).Output()
-	if err != nil {
-		return nil
+	ch := make(chan entry, len(paths))
+	var wg sync.WaitGroup
+	for _, p := range paths {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			ch <- entry{path, dirSize(ctx, path)}
+		}(p)
 	}
+	wg.Wait()
+	close(ch)
+
 	var result []entry
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		kb, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
-		if err != nil {
-			continue
-		}
-		result = append(result, entry{parts[1], kb * 1024})
+	for e := range ch {
+		result = append(result, e)
 	}
 	return result
 }
@@ -132,7 +268,6 @@ func printSection(title string, entries []entry, minBytes int64) {
 	for _, e := range filtered {
 		total += e.bytes
 	}
-
 	fmt.Printf("  %s\n", title)
 	fmt.Println("  " + strings.Repeat("─", 80))
 	for _, e := range filtered {
@@ -143,8 +278,7 @@ func printSection(title string, entries []entry, minBytes int64) {
 
 func spinner(label <-chan string, done <-chan struct{}) {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	i := 0
-	current := "scanning..."
+	i, current := 0, "scanning..."
 	for {
 		select {
 		case <-done:
@@ -162,6 +296,7 @@ func spinner(label <-chan string, done <-chan struct{}) {
 
 func main() {
 	minGB := flag.Float64("min", 1.0, "minimum size in GB to show")
+	timeoutSec := flag.Int("timeout", 60, "scan timeout in seconds")
 	showVer := flag.Bool("version", false, "print version")
 	flag.Parse()
 
@@ -172,47 +307,88 @@ func main() {
 
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: cannot determine home directory:", err)
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 
-	spinLabel := make(chan string, 1)
+	spinLabel := make(chan string, 16)
 	spinDone := make(chan struct{})
 	go spinner(spinLabel, spinDone)
 
-	// phase 1: top-level dir sizes
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSec)*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
 	seen := map[string]bool{}
 	var all []entry
-	for _, rel := range scanRoots {
-		root := home
-		if rel != "" {
-			root = filepath.Join(home, rel)
-			select {
-			case spinLabel <- "scanning ~/" + rel:
-			default:
-			}
-		}
-		for _, e := range scan(root) {
+	var cleanup []entry
+	var wg sync.WaitGroup
+
+	addAll := func(entries []entry) {
+		mu.Lock()
+		for _, e := range entries {
 			if !seen[e.path] {
 				seen[e.path] = true
 				all = append(all, e)
 			}
 		}
+		mu.Unlock()
 	}
 
-	// phase 2: find cleanup candidates
-	select {
-	case spinLabel <- "finding node_modules · .venv · venv ...":
-	default:
+	// drill into known hotspot dirs
+	for _, rel := range drillRoots {
+		rel := rel
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			addAll(scanDir(ctx, filepath.Join(home, rel), spinLabel))
+		}()
 	}
-	cleanup := findCleanup(home)
 
+	// measure single dirs
+	for _, rel := range singleRoots {
+		rel := rel
+		p := filepath.Join(home, rel)
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case spinLabel <- "scanning " + shortenPath(p):
+			default:
+			}
+			size := dirSize(ctx, p)
+			if size > 0 {
+				mu.Lock()
+				if !seen[p] {
+					seen[p] = true
+					all = append(all, entry{p, size})
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// find node_modules / venvs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case spinLabel <- "finding node_modules · .venv · venv...":
+		default:
+		}
+		cleanup = findCleanup(ctx, home)
+	}()
+
+	wg.Wait()
 	close(spinDone)
 	time.Sleep(90 * time.Millisecond)
 
 	min := int64(*minGB * float64(1<<30))
-
 	fmt.Println()
 	printSection("DISK HOGS", all, min)
-	printSection("CLEANUP CANDIDATES  (node_modules · .venv · venv)", cleanup, 10<<20) // >= 10 MB
+	printSection("CLEANUP CANDIDATES  (node_modules · .venv · venv)", cleanup, 10<<20)
+
 }
