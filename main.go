@@ -53,6 +53,45 @@ func scan(root string) []entry {
 	return result
 }
 
+// findCleanup locates node_modules, .venv, and venv dirs and returns their sizes.
+func findCleanup(home string) []entry {
+	out, err := exec.Command("find", home, "-maxdepth", "7", "-type", "d",
+		"(", "-name", "node_modules", "-o", "-name", ".venv", "-o", "-name", "venv", ")",
+		"-prune").Output()
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, p := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+
+	// du -sk on all paths at once
+	args := append([]string{"-sk"}, paths...)
+	out, err = exec.Command("du", args...).Output()
+	if err != nil {
+		return nil
+	}
+	var result []entry
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		kb, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+		if err != nil {
+			continue
+		}
+		result = append(result, entry{parts[1], kb * 1024})
+	}
+	return result
+}
+
 func human(b int64) string {
 	switch {
 	case b >= 1<<30:
@@ -75,6 +114,52 @@ func bar(b, max int64, width int) string {
 	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 }
 
+func printSection(title string, entries []entry, minBytes int64) {
+	var filtered []entry
+	for _, e := range entries {
+		if e.bytes >= minBytes {
+			filtered = append(filtered, e)
+		}
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].bytes > filtered[j].bytes
+	})
+	maxBytes := filtered[0].bytes
+	var total int64
+	for _, e := range filtered {
+		total += e.bytes
+	}
+
+	fmt.Printf("  %s\n", title)
+	fmt.Println("  " + strings.Repeat("─", 80))
+	for _, e := range filtered {
+		fmt.Printf("  %-8s  [%s]  %s\n", human(e.bytes), bar(e.bytes, maxBytes, 18), e.path)
+	}
+	fmt.Printf("  %s  total: %s\n\n", strings.Repeat("─", 30), human(total))
+}
+
+func spinner(label <-chan string, done <-chan struct{}) {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	i := 0
+	current := "scanning..."
+	for {
+		select {
+		case <-done:
+			fmt.Print("\r\033[K")
+			return
+		case l := <-label:
+			current = l
+		default:
+			fmt.Printf("\r  %s %s", frames[i%len(frames)], current)
+			time.Sleep(80 * time.Millisecond)
+			i++
+		}
+	}
+}
+
 func main() {
 	minGB := flag.Float64("min", 1.0, "minimum size in GB to show")
 	showVer := flag.Bool("version", false, "print version")
@@ -91,28 +176,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// spinner while scanning
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	spinDone := make(chan struct{})
 	spinLabel := make(chan string, 1)
-	go func() {
-		i := 0
-		label := "scanning..."
-		for {
-			select {
-			case <-spinDone:
-				fmt.Print("\r\033[K")
-				return
-			case l := <-spinLabel:
-				label = l
-			default:
-				fmt.Printf("\r  %s %s", frames[i%len(frames)], label)
-				time.Sleep(80 * time.Millisecond)
-				i++
-			}
-		}
-	}()
+	spinDone := make(chan struct{})
+	go spinner(spinLabel, spinDone)
 
+	// phase 1: top-level dir sizes
 	seen := map[string]bool{}
 	var all []entry
 	for _, rel := range scanRoots {
@@ -131,31 +199,20 @@ func main() {
 			}
 		}
 	}
+
+	// phase 2: find cleanup candidates
+	select {
+	case spinLabel <- "finding node_modules · .venv · venv ...":
+	default:
+	}
+	cleanup := findCleanup(home)
+
 	close(spinDone)
-	time.Sleep(90 * time.Millisecond) // let spinner goroutine clear the line
+	time.Sleep(90 * time.Millisecond)
 
 	min := int64(*minGB * float64(1<<30))
-	var filtered []entry
-	for _, e := range all {
-		if e.bytes >= min {
-			filtered = append(filtered, e)
-		}
-	}
 
-	if len(filtered) == 0 {
-		fmt.Printf("nothing above %.1f GB\n", *minGB)
-		return
-	}
-
-	sort.Slice(filtered, func(i, j int) bool {
-		return filtered[i].bytes > filtered[j].bytes
-	})
-
-	maxBytes := filtered[0].bytes
-	fmt.Printf("\n  %-8s  %-20s  %s\n", "SIZE", "BAR", "PATH")
-	fmt.Println("  " + strings.Repeat("─", 80))
-	for _, e := range filtered {
-		fmt.Printf("  %-8s  [%s]  %s\n", human(e.bytes), bar(e.bytes, maxBytes, 18), e.path)
-	}
 	fmt.Println()
+	printSection("DISK HOGS", all, min)
+	printSection("CLEANUP CANDIDATES  (node_modules · .venv · venv)", cleanup, 10<<20) // >= 10 MB
 }
