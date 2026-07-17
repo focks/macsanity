@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const version = "0.1.0"
@@ -90,12 +91,38 @@ func main() {
 		os.Exit(1)
 	}
 
+	// spinner while scanning
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	spinDone := make(chan struct{})
+	spinLabel := make(chan string, 1)
+	go func() {
+		i := 0
+		label := "scanning..."
+		for {
+			select {
+			case <-spinDone:
+				fmt.Print("\r\033[K")
+				return
+			case l := <-spinLabel:
+				label = l
+			default:
+				fmt.Printf("\r  %s %s", frames[i%len(frames)], label)
+				time.Sleep(80 * time.Millisecond)
+				i++
+			}
+		}
+	}()
+
 	seen := map[string]bool{}
 	var all []entry
 	for _, rel := range scanRoots {
 		root := home
 		if rel != "" {
 			root = filepath.Join(home, rel)
+			select {
+			case spinLabel <- "scanning ~/" + rel:
+			default:
+			}
 		}
 		for _, e := range scan(root) {
 			if !seen[e.path] {
@@ -104,6 +131,8 @@ func main() {
 			}
 		}
 	}
+	close(spinDone)
+	time.Sleep(90 * time.Millisecond) // let spinner goroutine clear the line
 
 	min := int64(*minGB * float64(1<<30))
 	var filtered []entry
