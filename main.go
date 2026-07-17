@@ -311,6 +311,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// if a directory is given as arg, scan it directly instead of the home-based hotspot scan
+	targetDir := ""
+	if args := flag.Args(); len(args) > 0 {
+		targetDir, err = filepath.Abs(args[0])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	}
+
 	spinLabel := make(chan string, 16)
 	spinDone := make(chan struct{})
 	go spinner(spinLabel, spinDone)
@@ -335,52 +345,98 @@ func main() {
 		mu.Unlock()
 	}
 
-	// drill into known hotspot dirs
-	for _, rel := range drillRoots {
-		rel := rel
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			addAll(scanDir(ctx, filepath.Join(home, rel), spinLabel))
-		}()
-	}
-
-	// measure single dirs
-	for _, rel := range singleRoots {
-		rel := rel
-		p := filepath.Join(home, rel)
-		if _, err := os.Stat(p); err != nil {
-			continue
-		}
+	if targetDir != "" {
+		// directory mode: drill into the given dir + find cleanup candidates inside it
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			select {
-			case spinLabel <- "scanning " + shortenPath(p):
+			case spinLabel <- "scanning " + shortenPath(targetDir):
 			default:
 			}
-			size := dirSize(ctx, p)
-			if size > 0 {
-				mu.Lock()
-				if !seen[p] {
-					seen[p] = true
-					all = append(all, entry{p, size})
+			addAll(scanDir(ctx, targetDir, spinLabel))
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case spinLabel <- "finding node_modules · .venv · venv...":
+			default:
+			}
+			// ponytail: reuse findCleanup by temporarily swapping cleanupSearchRoots
+			out, _ := exec.CommandContext(ctx, "find", targetDir,
+				"-maxdepth", "7", "-type", "d",
+				"(", "-name", "node_modules", "-o", "-name", ".venv", "-o", "-name", "venv", ")",
+				"-prune").Output()
+			var paths []string
+			for _, p := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if p != "" {
+					paths = append(paths, p)
 				}
-				mu.Unlock()
+			}
+			ch := make(chan entry, len(paths))
+			var cwg sync.WaitGroup
+			for _, p := range paths {
+				cwg.Add(1)
+				go func(path string) {
+					defer cwg.Done()
+					ch <- entry{path, dirSize(ctx, path)}
+				}(p)
+			}
+			cwg.Wait()
+			close(ch)
+			for e := range ch {
+				cleanup = append(cleanup, e)
 			}
 		}()
-	}
-
-	// find node_modules / venvs
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		select {
-		case spinLabel <- "finding node_modules · .venv · venv...":
-		default:
+	} else {
+		// home mode: drill into known hotspot dirs
+		for _, rel := range drillRoots {
+			rel := rel
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				addAll(scanDir(ctx, filepath.Join(home, rel), spinLabel))
+			}()
 		}
-		cleanup = findCleanup(ctx, home)
-	}()
+
+		// measure single dirs
+		for _, rel := range singleRoots {
+			rel := rel
+			p := filepath.Join(home, rel)
+			if _, err := os.Stat(p); err != nil {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case spinLabel <- "scanning " + shortenPath(p):
+				default:
+				}
+				size := dirSize(ctx, p)
+				if size > 0 {
+					mu.Lock()
+					if !seen[p] {
+						seen[p] = true
+						all = append(all, entry{p, size})
+					}
+					mu.Unlock()
+				}
+			}()
+		}
+
+		// find node_modules / venvs
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case spinLabel <- "finding node_modules · .venv · venv...":
+			default:
+			}
+			cleanup = findCleanup(ctx, home)
+		}()
+	}
 
 	wg.Wait()
 	close(spinDone)
